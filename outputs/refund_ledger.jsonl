@@ -1,0 +1,4 @@
+{"ts": "2026-10-19 12:58:50", "run_id": "S1", "order_id": "ORD-100048", "customer_id": "C0007", "action": "refund_issued", "refund_inr": 128.25}
+{"ts": "2026-10-19 12:58:50", "run_id": "S2", "order_id": "ORD-100067", "customer_id": "C0008", "action": "refund_issued", "refund_inr": 135.0}
+{"ts": "2026-10-19 12:58:50", "run_id": "S3", "order_id": "ORD-100145", "customer_id": "C0016", "action": "escalated", "refund_inr": 1999.0}
+{"ts": "2026-10-19 12:58:50", "run_id": "DEMO_CRASH", "order_id": "ORD-100072", "customer_id": "C0008", "action": "refund_issued", "refund_inr": 360.0}
