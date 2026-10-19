@@ -1,18 +1,33 @@
 {
  "run_id": "S6",
- "customer_id": "C0001",
- "message": "Refund for order ORD-999999 please.",
- "steps": 2,
- "tokens": 144,
+ "scenario_id": "S6",
+ "max_iterations": 6,
+ "token_limit": 6000,
+ "time_limit_seconds": 10,
+ "llm_calls": 2,
+ "tokens_used": 144,
+ "step": 1,
  "tools_executed": [
   "get_order"
  ],
- "status": "NOT_FOUND",
+ "steps": [
+  {
+   "step": 1,
+   "tool": "get_order",
+   "arguments": {
+    "order_id": "ORD-999999"
+   },
+   "observation": {
+    "error": "order not found"
+   }
+  }
+ ],
  "resumed": false,
+ "finished": true,
  "messages": [
   {
    "role": "system",
-   "content": "You are the Instamart refund AGENT. Use the tools to look up the order, check the refund policy, compute the refund and then either issue it or escalate it. Never refund more than the policy allows."
+   "content": "You are the Instamart refund AGENT. Use the tools to look up the order, check the refund policy, compute the refund, then issue it or escalate it to a human. Never refund more than the policy allows."
   },
   {
    "role": "user",
@@ -35,9 +50,10 @@
    "role": "tool",
    "tool_call_id": "call_1",
    "name": "get_order",
-   "content": "{\"error\": \"order not found for this customer\"}"
+   "content": "{\"error\": \"order not found\"}"
   }
  ],
- "final": "NOT_FOUND: no such order.",
+ "status": "NOT_FOUND",
+ "final_answer": "NOT_FOUND: no such order.",
  "refund_inr": 0.0
 }

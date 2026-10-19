@@ -1,5 +1,5 @@
-"""Part D -- refund agent (ReAct loop over mock_llm AGENT) with tools backed by data/instamart.db and the policy
-retriever, hard guardrails, a step limit, a token budget, an idempotent refund ledger, and checkpoint/resume.
+"""Part D (tasks 5-8) -- refund agent: TOOLS_SPEC + TOOL_MAP over data/instamart.db and the policy retriever,
+a ReAct loop with iteration / token / time limits, checkpoints in state/ and resume_agent().
 Run from the repository root (after Part A):  python src/part_d_agent.py"""
 import json
 import os
@@ -7,204 +7,178 @@ import shutil
 import sqlite3
 import sys
 import time
+from datetime import datetime
 
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mock_llm  # noqa: E402
-from mock_llm import est_tokens  # noqa: E402
-from policy_rag import PolicyIndex  # noqa: E402
+from policy_rag import retrieve  # noqa: E402
 
 DB = os.path.join("data", "instamart.db")
 OUT, STATE = "outputs", "state"
 RUNS, LEDGER = os.path.join(OUT, "agent_runs.jsonl"), os.path.join(OUT, "refund_ledger.jsonl")
-MAX_STEPS = 6                  # escalation_policy.txt: hand over to a human after 6 steps
-TOKEN_BUDGET = 4000            # per run, sum of response.usage.total_tokens
-AUTO_LIMIT_INR = 1000          # refund_policy.txt: above this a human lead must approve
-LATE_MINUTES = 45
+LATE_MINUTES, AUTO_LIMIT_INR = 45, 1000
 SYSTEM = ("You are the Instamart refund AGENT. Use the tools to look up the order, check the refund policy, "
-          "compute the refund and then either issue it or escalate it. Never refund more than the policy allows.")
-TOOLS = [{"name": "get_order", "parameters": {"order_id": "string"}},
-         {"name": "search_policy", "parameters": {"query": "string"}},
-         {"name": "calculate_refund", "parameters": {"order_amount": "number", "delivery_minutes": "number"}},
-         {"name": "issue_refund", "parameters": {"order_id": "string", "refund_inr": "number"}},
-         {"name": "escalate_to_human", "parameters": {"order_id": "string", "refund_inr": "number"}}]
-
-_index = None
-
-
-class SimulatedCrash(Exception):
-    """Injected process crash used by the crash-and-resume demonstration."""
-
-
-# ------------------------------------------------------------------ ledger
-def read_ledger():
-    if not os.path.exists(LEDGER):
-        return []
-    with open(LEDGER, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
-
-
-def append_jsonl(path, obj):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj) + "\n")
+          "compute the refund, then issue it or escalate it to a human. Never refund more than the policy allows.")
 
 
 # ------------------------------------------------------------------ tools
-class Tools:
-    """Tool implementations. The agent's customer_id is bound here, so a tool can never act for another customer."""
+def _ledger(tool, order_id, refund_inr, run_id=None):
+    with open(LEDGER, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"timestamp": datetime.now().isoformat(timespec="seconds"), "tool": tool,
+                            "order_id": order_id, "refund_inr": refund_inr, "run_id": run_id}) + "\n")
 
-    def __init__(self, customer_id, run_id, db_path=DB):
-        self.customer_id, self.run_id, self.db_path = customer_id, run_id, db_path
-        self.verified = {}                 # order_id -> order dict fetched in this run
 
-    def get_order(self, order_id):
-        with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as con:
-            row = con.execute("SELECT order_id, customer_id, status, order_amount, delivery_minutes, order_ts "
-                              "FROM orders WHERE order_id = ?", (order_id,)).fetchone()
-        if row is None or row[1] != self.customer_id:      # unknown order, or not this customer's order
-            return {"error": "order not found for this customer"}
-        o = dict(zip(["order_id", "customer_id", "status", "order_amount", "delivery_minutes", "order_ts"], row))
-        self.verified[order_id] = o
-        return o
+def _already_issued(order_id):
+    if not os.path.exists(LEDGER):
+        return False
+    with open(LEDGER, encoding="utf-8") as f:
+        return any(json.loads(l)["tool"] == "issue_refund" and json.loads(l)["order_id"] == order_id for l in f)
 
-    def search_policy(self, query):
-        global _index
-        _index = _index or PolicyIndex()
-        return {"results": [{"doc": h["doc"], "text": h["text"]} for h in _index.retrieve(query)]}
 
-    def calculate_refund(self, order_amount, delivery_minutes):
-        late = delivery_minutes is not None and delivery_minutes > LATE_MINUTES
-        return {"refund_inr": round(float(order_amount), 2) if late else 0.0,
-                "rule": f"full refund only if delivered in more than {LATE_MINUTES} minutes"}
+def get_order(order_id):
+    with sqlite3.connect(DB) as con:
+        row = con.execute("SELECT order_id, status, order_amount, delivery_minutes FROM orders WHERE order_id = ?",
+                          (order_id,)).fetchone()
+    if row is None:
+        return {"error": "order not found"}
+    return dict(zip(["order_id", "status", "order_amount", "delivery_minutes"], row))
 
-    def _check(self, order_id, refund_inr):
-        """Server-side guardrail: re-derive the allowed refund from the database, ignore what the model claims."""
-        o = self.verified.get(order_id) or self.get_order(order_id)
-        if "error" in o:
-            return None, "order not verified"
-        if o["status"] != "completed":
-            return None, "only completed orders can be refunded"
-        allowed = self.calculate_refund(o["order_amount"], o["delivery_minutes"])["refund_inr"]
-        if allowed <= 0 or abs(float(refund_inr) - allowed) > 0.005:
-            return None, f"requested INR {refund_inr} but policy allows INR {allowed}"
-        return allowed, None
 
-    def issue_refund(self, order_id, refund_inr):
-        allowed, err = self._check(order_id, refund_inr)
-        if err:
-            return {"error": err}
-        if allowed > AUTO_LIMIT_INR:
-            return {"error": f"refund above INR {AUTO_LIMIT_INR} needs a human lead"}
-        done = [e for e in read_ledger() if e["order_id"] == order_id and e["action"] == "refund_issued"]
-        if done:                                              # idempotency: never pay the same order twice
-            return {"refund_inr": done[0]["refund_inr"], "status": "already_refunded"}
-        append_jsonl(LEDGER, {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "run_id": self.run_id,
-                              "order_id": order_id, "customer_id": self.customer_id,
-                              "action": "refund_issued", "refund_inr": allowed})
-        return {"refund_inr": allowed, "status": "issued"}
+def search_policy(query):
+    return {"results": retrieve(query, k=3)}
 
-    def escalate_to_human(self, order_id, refund_inr):
-        allowed, err = self._check(order_id, refund_inr)
-        if err:
-            return {"error": err}
-        done = [e for e in read_ledger() if e["order_id"] == order_id and e["action"] == "escalated"]
-        if not done:
-            append_jsonl(LEDGER, {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "run_id": self.run_id,
-                                  "order_id": order_id, "customer_id": self.customer_id,
-                                  "action": "escalated", "refund_inr": allowed})
-        return {"refund_inr": allowed, "status": "escalated"}
 
-    def execute(self, name, args):
-        if name not in {t["name"] for t in TOOLS}:
-            return {"error": f"unknown tool {name}"}
-        try:
-            return getattr(self, name)(**args)
-        except Exception as e:                               # an infrastructure failure is reported, not raised
-            return {"error": f"{type(e).__name__}: {e}", "tool_failure": True}
+def calculate_refund(order_amount, delivery_minutes):
+    late = delivery_minutes is not None and float(delivery_minutes) > LATE_MINUTES
+    return {"refund_inr": round(float(order_amount), 2) if late else 0.0}
+
+
+def issue_refund(order_id, refund_inr):
+    if float(refund_inr) > AUTO_LIMIT_INR:                       # guardrail: never auto-pay above the limit
+        return {"error": f"refund above INR {AUTO_LIMIT_INR} must be escalated", "refund_inr": 0.0}
+    if _already_issued(order_id):                                # idempotency: never pay one order twice
+        return {"refund_inr": refund_inr, "note": "already refunded earlier; no second payment"}
+    _ledger("issue_refund", order_id, refund_inr, _current_run)
+    return {"refund_inr": refund_inr}
+
+
+def escalate_to_human(order_id, refund_inr):
+    _ledger("escalate_to_human", order_id, refund_inr, _current_run)
+    return {"refund_inr": refund_inr}
+
+
+TOOLS_SPEC = [
+    {"name": "get_order", "description": "Look up one order in the Instamart database by its order id.",
+     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}},
+    {"name": "search_policy", "description": "Retrieve the three policy chunks most relevant to a query.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "calculate_refund",
+     "description": "Compute the refund: full order amount if delivered in more than 45 minutes, else 0.",
+     "parameters": {"type": "object", "properties": {"order_amount": {"type": "number"},
+                                                     "delivery_minutes": {"type": "number"}},
+                    "required": ["order_amount", "delivery_minutes"]}},
+    {"name": "issue_refund", "description": "Pay an approved refund of at most INR 1000 and record it in the ledger.",
+     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}, "refund_inr": {"type": "number"}},
+                    "required": ["order_id", "refund_inr"]}},
+    {"name": "escalate_to_human", "description": "Send a refund above INR 1000 to a human support lead for approval.",
+     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}, "refund_inr": {"type": "number"}},
+                    "required": ["order_id", "refund_inr"]}},
+]
+TOOL_MAP = {"get_order": get_order, "search_policy": search_policy, "calculate_refund": calculate_refund,
+            "issue_refund": issue_refund, "escalate_to_human": escalate_to_human}
+_current_run = None
 
 
 # ------------------------------------------------------------------ agent loop
-def checkpoint(state):
+class SimulatedCrash(Exception):
+    """Injected process crash for the crash-and-resume demonstration."""
+
+
+def _save(state):
     os.makedirs(STATE, exist_ok=True)
     tmp = os.path.join(STATE, f"{state['run_id']}.json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=1)
-    os.replace(tmp, os.path.join(STATE, f"{state['run_id']}.json"))   # atomic: never a half-written state
+    os.replace(tmp, os.path.join(STATE, f"{state['run_id']}.json"))     # atomic replace
 
 
-def run_agent(run_id, customer_id, message, *, db_path=DB, token_budget=TOKEN_BUDGET, crash_after_tools=None,
-              resume=False):
-    path = os.path.join(STATE, f"{run_id}.json")
-    if resume:
-        with open(path, encoding="utf-8") as f:
-            state = json.load(f)
-        state["resumed"] = True
-        print(f"  [resume] {run_id}: {state['steps']} steps and tools {state['tools_executed']} restored from {path}")
-    else:
-        state = {"run_id": run_id, "customer_id": customer_id, "message": message, "steps": 0, "tokens": 0,
-                 "tools_executed": [], "status": "running", "resumed": False,
-                 "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": message}]}
-        checkpoint(state)
-    tools = Tools(state["customer_id"], run_id, db_path)
-    for m in state["messages"]:              # rebuild the verified-order cache from the restored transcript
-        if m["role"] == "tool" and m["name"] == "get_order":
-            o = json.loads(m["content"])
-            if "error" not in o:
-                tools.verified[o["order_id"]] = o
+def _handoff(state, reason):
+    tools = ", ".join(state["tools_executed"]) or "none"
+    return (f"Handed to a human agent ({reason}). Request: '{state['messages'][1]['content']}'. "
+            f"Tools completed: {tools}. Model calls: {state['llm_calls']}, tokens: {state['tokens_used']}.")
 
-    final, outcome = None, None
+
+def _loop(state, crash_after_tools=None):
+    global _current_run
+    _current_run = state["run_id"]
+    started = time.monotonic()
+    status = final = None
     while True:
-        if state["steps"] >= MAX_STEPS:
-            outcome, final = "FALLBACK", (f"Handed to a human agent after {MAX_STEPS} steps. Summary: customer "
-                                          f"{state['customer_id']} asked '{message}'; tools used: "
-                                          f"{', '.join(state['tools_executed']) or 'none'}.")
+        if time.monotonic() - started >= state["time_limit_seconds"]:
+            status, final = "FALLBACK_TIMEOUT", _handoff(state, "time limit reached")
             break
-        if state["tokens"] >= token_budget:
-            outcome, final = "STOPPED_BUDGET", (f"Stopped safely: token budget {token_budget} used up "
-                                                f"({state['tokens']}); handed to a human agent.")
+        if state["llm_calls"] >= state["max_iterations"]:
+            status, final = "FALLBACK_MAX_ITERATIONS", _handoff(state, f"{state['max_iterations']} model calls "
+                                                                       "without a final answer")
             break
-        resp = mock_llm.chat(state["messages"], tools=TOOLS)
-        state["steps"] += 1
-        state["tokens"] += resp.usage.total_tokens
+        resp = mock_llm.chat(state["messages"], tools=TOOLS_SPEC)
+        state["llm_calls"] += 1
+        state["tokens_used"] += resp.usage.total_tokens
         msg = resp.choices[0].message
+        if state["tokens_used"] > state["token_limit"]:          # stop before executing any requested tool
+            status, final = "FALLBACK_TOKEN_LIMIT", _handoff(state, f"token limit {state['token_limit']} exceeded")
+            break
         if not msg.tool_calls:
             final = msg.content
-            outcome = final.split(":", 1)[0].strip()
+            status = final.split(":", 1)[0].strip()
             break
         calls = [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in msg.tool_calls]
         state["messages"].append({"role": "assistant", "content": None, "tool_calls": calls})
         for tc in calls:
-            result = tools.execute(tc["name"], tc["arguments"])
+            fn = TOOL_MAP.get(tc["name"])
+            obs = fn(**tc["arguments"]) if fn else {"error": f"unknown tool {tc['name']}"}
             state["messages"].append({"role": "tool", "tool_call_id": tc["id"], "name": tc["name"],
-                                      "content": json.dumps(result)})
+                                      "content": json.dumps(obs)})
+            state["step"] += 1
             state["tools_executed"].append(tc["name"])
-            checkpoint(state)
-            # "order not found" is a business answer the model handles; anything else is a stop
-            if "error" in result and (result.get("tool_failure") or tc["name"] != "get_order"):
-                outcome, final = "STOPPED_TOOL_ERROR", f"Stopped safely: {tc['name']} failed ({result['error']})."
-                break
-            if crash_after_tools is not None and len(state["tools_executed"]) == crash_after_tools \
-                    and not state["resumed"]:
-                raise SimulatedCrash(f"process killed after {crash_after_tools} tool executions")
-        if outcome:
-            break
+            state["steps"].append({"step": state["step"], "tool": tc["name"], "arguments": tc["arguments"],
+                                   "observation": obs})
+            _save(state)
+            if crash_after_tools is not None and len(state["tools_executed"]) == crash_after_tools:
+                raise SimulatedCrash(f"simulated crash after tool execution {crash_after_tools}")
 
     refund = 0.0
-    for m in state["messages"]:
-        if m["role"] == "tool" and m["name"] in ("issue_refund", "escalate_to_human"):
-            data = json.loads(m["content"])
-            refund = data.get("refund_inr", refund)
-            if data.get("status") == "already_refunded":     # trust the ledger, not the model's wording
-                outcome, refund = "ALREADY_REFUNDED", 0.0
-                final = f"No new payment: {data['refund_inr']} INR was already refunded for this order."
-    state.update(status=outcome, final=final, refund_inr=refund)
-    checkpoint(state)
-    record = {k: state[k] for k in ("run_id", "customer_id", "message", "status", "refund_inr", "steps",
-                                    "tokens", "tools_executed", "resumed", "final")}
-    append_jsonl(RUNS, record)
-    return record
+    if status in ("REFUND", "ESCALATE"):
+        refund = next(s["observation"]["refund_inr"] for s in reversed(state["steps"])
+                      if s["tool"] in ("issue_refund", "escalate_to_human"))
+    state.update(status=status, final_answer=final, refund_inr=refund, finished=True)
+    _save(state)
+    with open(RUNS, "a", encoding="utf-8") as f:
+        f.write(json.dumps({k: state[k] for k in ("run_id", "scenario_id", "status", "final_answer", "refund_inr",
+                                                  "llm_calls", "tokens_used", "resumed", "steps")}) + "\n")
+    return {k: state[k] for k in ("status", "final_answer", "steps", "llm_calls", "tokens_used", "refund_inr",
+                                  "tools_executed")}
+
+
+def run_agent(user_message, scenario_id, max_iterations=6, token_limit=6000, time_limit_seconds=10,
+              run_id=None, crash_after_tools=None):
+    state = {"run_id": run_id or scenario_id, "scenario_id": scenario_id, "max_iterations": max_iterations,
+             "token_limit": token_limit, "time_limit_seconds": time_limit_seconds, "llm_calls": 0,
+             "tokens_used": 0, "step": 0, "tools_executed": [], "steps": [], "resumed": False, "finished": False,
+             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user_message}]}
+    return _loop(state, crash_after_tools)
+
+
+def resume_agent(run_id):
+    with open(os.path.join(STATE, f"{run_id}.json"), encoding="utf-8") as f:
+        state = json.load(f)
+    if state.get("finished"):
+        raise ValueError(f"run {run_id} already finished")
+    state["resumed"] = True
+    return _loop(state)
 
 
 # ------------------------------------------------------------------ demonstrations
@@ -214,60 +188,45 @@ def main():
         if os.path.exists(p):
             os.remove(p)
     shutil.rmtree(STATE, ignore_errors=True)
-    os.makedirs(STATE)
 
     sc = pd.read_csv(os.path.join("data", "raw", "agent_scenarios.csv"))
     rows = []
     for s in sc.itertuples(index=False):
-        r = run_agent(s.scenario_id, s.customer_id, s.message)
-        ok = r["status"] == s.expected_outcome and abs(r["refund_inr"] - s.expected_refund_inr) < 0.005 \
-            if s.expected_outcome in ("REFUND", "ESCALATE") else r["status"] == s.expected_outcome
-        rows.append({"scenario": s.scenario_id, "customer": s.customer_id, "expected": s.expected_outcome,
-                     "outcome": r["status"], "expected_inr": f"{s.expected_refund_inr:.2f}",
-                     "refund_inr": f"{r['refund_inr']:.2f}", "steps": r["steps"], "tokens": r["tokens"],
-                     "tools": " > ".join(r["tools_executed"]), "match": ok})
+        r = run_agent(s.message, s.scenario_id)
+        expected = "FALLBACK_MAX_ITERATIONS" if s.expected_outcome == "FALLBACK" else s.expected_outcome
+        ok = r["status"] == expected and abs(r["refund_inr"] - s.expected_refund_inr) < 0.01
+        rows.append({"scenario": s.scenario_id, "expected": s.expected_outcome, "status": r["status"],
+                     "refund_inr": f"{r['refund_inr']:.2f}", "llm_calls": r["llm_calls"],
+                     "tokens_used": r["tokens_used"], "tools": " > ".join(r["tools_executed"]), "match": ok})
     res = pd.DataFrame(rows)
-    print("=== seven scenarios ===")
+    print("=== seven scenarios (max_iterations=6, token_limit=6000, time_limit_seconds=10) ===")
     print(res.to_string(index=False))
     print(f"matched {int(res['match'].sum())}/{len(res)}")
+    assert res["match"].all()
 
     print("\n=== stop-safely demonstrations ===")
     s1 = sc.iloc[0]
-    d1 = run_agent("DEMO_BUDGET", s1.customer_id, s1.message, token_budget=300)
-    print(f"token budget 300 on {s1.scenario_id}: status {d1['status']} after {d1['steps']} steps, "
-          f"{d1['tokens']} tokens, tools {d1['tools_executed']}")
-    d2 = run_agent("DEMO_DB_DOWN", s1.customer_id, s1.message, db_path=os.path.join(STATE, "missing.db"))
-    print(f"database unavailable on {s1.scenario_id}: status {d2['status']} after {d2['steps']} steps, "
-          f"tools {d2['tools_executed']}")
-    print(f"  final: {d2['final']}")
-    d3 = run_agent("DEMO_REPEAT_S1", s1.customer_id, s1.message)
-    paid = [e for e in read_ledger() if e["order_id"] == "ORD-100048" and e["action"] == "refund_issued"]
-    print(f"(idempotency check) repeat of {s1.scenario_id}: status {d3['status']}; "
-          f"ledger refund entries for that order: {len(paid)}")
+    d = run_agent(s1.message, "S1", token_limit=200, run_id="S1_token_limit_200")
+    print(f"S1 token_limit=200: {d['status']} after {d['llm_calls']} model calls, {d['tokens_used']} tokens, "
+          f"tools {d['tools_executed']}\n  {d['final_answer']}")
+    d = run_agent(s1.message, "S1", time_limit_seconds=0, run_id="S1_time_limit_0")
+    print(f"S1 time_limit_seconds=0: {d['status']} after {d['llm_calls']} model calls\n  {d['final_answer']}")
 
-    print("\n=== crash and resume ===")
-    with sqlite3.connect(DB) as con:
-        used = tuple(sc["message"].str.extract(r"(ORD-\d{6})")[0])
-        oid, cid, amt = con.execute(
-            "SELECT order_id, customer_id, order_amount FROM orders WHERE status='completed' AND delivery_minutes > 45 "
-            f"AND order_amount <= 1000 AND order_id NOT IN ({','.join('?' * len(used))}) ORDER BY order_id LIMIT 1",
-            used).fetchone()
-    msg = f"My order {oid} reached me very late. I would like a refund."
+    print("\n=== crash and resume (S1) ===")
     try:
-        run_agent("DEMO_CRASH", cid, msg, crash_after_tools=2)
+        run_agent(s1.message, "S1", run_id="S1_crash_resume", crash_after_tools=2)
     except SimulatedCrash as e:
-        with open(os.path.join(STATE, "DEMO_CRASH.json"), encoding="utf-8") as f:
+        with open(os.path.join(STATE, "S1_crash_resume.json"), encoding="utf-8") as f:
             before = json.load(f)["tools_executed"]
-        print(f"crash: {e}; tools executed before crash: {before}")
-    r = run_agent("DEMO_CRASH", cid, None, resume=True)
-    after = r["tools_executed"][len(before):]
-    paid = [e for e in read_ledger() if e["order_id"] == oid and e["action"] == "refund_issued"]
-    print(f"resumed: status {r['status']} INR {r['refund_inr']:.2f} (order amount INR {amt:.2f}); "
-          f"tools executed after resume: {after}; full tool list: {r['tools_executed']}")
-    print(f"ledger refund entries for {oid}: {len(paid)}")
+        print(f"{e}; checkpoint holds tools {before}")
+    r = resume_agent("S1_crash_resume")
+    print(f"resumed: {r['status']} INR {r['refund_inr']:.2f}; tools across crash + resume: {r['tools_executed']}")
+    assert r["tools_executed"] == ["get_order", "search_policy", "calculate_refund", "issue_refund"]
+    assert r["status"] == "REFUND" and abs(r["refund_inr"] - 128.25) < 0.01
 
-    print(f"\nledger entries: {len(read_ledger())}; total refunded INR "
-          f"{sum(e['refund_inr'] for e in read_ledger() if e['action'] == 'refund_issued'):.2f}")
+    with open(LEDGER, encoding="utf-8") as f:
+        ledger = [json.loads(l) for l in f]
+    print(f"\nledger: {[(e['tool'], e['order_id'], e['refund_inr']) for e in ledger]}")
     print(f"wrote {RUNS}, {LEDGER} and {STATE}/")
 
 
