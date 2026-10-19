@@ -102,7 +102,15 @@ def _save(state):
     tmp = os.path.join(STATE, f"{state['run_id']}.json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=1)
-    os.replace(tmp, os.path.join(STATE, f"{state['run_id']}.json"))     # atomic replace
+    target = os.path.join(STATE, f"{state['run_id']}.json")
+    for attempt in range(20):            # atomic replace; retry while a sync client (e.g. OneDrive) holds the file
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.1)
 
 
 def _handoff(state, reason):
